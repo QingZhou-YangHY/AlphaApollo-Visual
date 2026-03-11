@@ -15,10 +15,12 @@
 # limitations under the License.
 
 import copy
+import inspect
 import logging
 import os
 import re
 from collections import defaultdict
+from pathlib import Path
 from typing import List, Optional, Union
 
 import datasets
@@ -97,10 +99,13 @@ class RLHFDataset(Dataset):
         self.tokenizer = tokenizer
         self.processor = processor
         self.config = config
+        self._warned_processor_fallback = False
 
         self.cache_dir = os.path.expanduser(config.get("cache_dir", "~/.cache/verl/rlhf"))
         self.prompt_key = config.get("prompt_key", "prompt")
         self.image_key = config.get("image_key", "images")
+        self.decoded_image_key = config.get("decoded_image_key", "decoded_image")
+        self.image_root = config.get("image_root", None)
         self.video_key = config.get("video_key", "videos")
         self.max_prompt_length = config.get("max_prompt_length", 1024)
         self.return_raw_chat = config.get("return_raw_chat", False)
@@ -117,6 +122,24 @@ class RLHFDataset(Dataset):
         self.serialize_dataset = False
         self._download()
         self._read_files_and_tokenize()
+
+    def _processor_supports_multimodal_kwargs(self) -> bool:
+        if self.processor is None:
+            return False
+
+        # Fast path: true multimodal processors expose `image_processor`.
+        # for most hf processors
+        if hasattr(self.processor, "image_processor"):
+            return True
+
+        try:
+            # Some environments resolve AutoProcessor to tokenizer-only classes.
+            # In that case, infer support by checking call signature kwargs.
+            call_sig = inspect.signature(self.processor.__call__)
+            params = call_sig.parameters
+            return "images" in params or "videos" in params
+        except (TypeError, ValueError):
+            return False
 
     def _download(self, use_origin_parquet=False):
         from verl.utils.fs import copy_to_local
@@ -139,8 +162,17 @@ class RLHFDataset(Dataset):
         if self.filter_overlong_prompts:
             tokenizer = self.tokenizer
             prompt_key = self.prompt_key
+
+            def _format_messages(doc):
+                messages = doc[prompt_key]
+                if isinstance(messages, str):
+                    messages = [{"role": "user", "content": messages}]
+                elif isinstance(messages, dict):
+                    messages = [messages]
+                return messages
+
             self.dataframe = self.dataframe.filter(
-                lambda doc: len(tokenizer.apply_chat_template(doc[prompt_key], add_generation_prompt=True)) <= self.max_prompt_length,
+                lambda doc: len(tokenizer.apply_chat_template(_format_messages(doc), add_generation_prompt=True)) <= self.max_prompt_length,
                 num_proc=self.num_workers,
                 desc=f"Filtering prompts longer than {self.max_prompt_length} tokens",
             )
@@ -162,9 +194,17 @@ class RLHFDataset(Dataset):
     def _build_messages(self, example: dict):
         messages: list = example.pop(self.prompt_key)
 
+        if isinstance(messages, str):
+            messages = [{"role": "user", "content": messages}]
+        elif isinstance(messages, dict):
+            messages = [messages]
+
         if self.image_key in example or self.video_key in example:
             for message in messages:
                 content = message["content"]
+                if isinstance(content, list):
+                    # Already multimodal content list from upstream preprocessing.
+                    continue
                 content_list = []
                 for segment in re.split("(<image>|<video>)", content):
                     if segment == "<image>":
@@ -178,6 +218,92 @@ class RLHFDataset(Dataset):
 
         return messages
 
+    def _resolve_image_item(self, image_item):
+        if image_item is None or not isinstance(image_item, (str, os.PathLike)):
+            return image_item
+
+        image_path = str(image_item)
+        if image_path.startswith(("http://", "https://", "file://", "data:")):
+            return image_path
+
+        path_obj = Path(image_path)
+        if path_obj.is_absolute():
+            return image_path
+
+        candidate_roots = []
+
+        if self.image_root:
+            candidate_roots.append(Path(os.path.expanduser(self.image_root)))
+
+        for data_file in self.original_data_files:
+            data_parent = Path(os.path.expanduser(str(data_file))).resolve().parent
+            candidate_roots.append(data_parent)
+            candidate_roots.append(data_parent.parent)
+
+        # Keep root order while removing duplicates.
+        seen = set()
+        unique_roots = []
+        for root in candidate_roots:
+            key = str(root)
+            if key not in seen:
+                seen.add(key)
+                unique_roots.append(root)
+
+        for root in unique_roots:
+            candidate = root / path_obj
+            if candidate.exists():
+                return str(candidate)
+
+        return image_path
+
+    def _to_list(self, maybe_list):
+        if maybe_list is None:
+            return None
+        if isinstance(maybe_list, list):
+            return maybe_list
+        return [maybe_list]
+
+    def _image_item_is_missing_path(self, image_item) -> bool:
+        if not isinstance(image_item, (str, os.PathLike)):
+            return False
+
+        image_path = str(image_item)
+        if image_path.startswith(("http://", "https://", "file://", "data:")):
+            return False
+
+        return not Path(image_path).exists()
+
+    def _pick_image_items(self, row_dict: dict):
+        primary_items = self._to_list(row_dict.pop(self.image_key, None)) if self.image_key in row_dict else None
+        decoded_items = self._to_list(row_dict.pop(self.decoded_image_key, None)) if self.decoded_image_key in row_dict else None
+
+        if primary_items is None:
+            return decoded_items
+
+        resolved_primary_items = [self._resolve_image_item(image) for image in primary_items]
+
+        if decoded_items is None:
+            return resolved_primary_items
+        
+        # 支持 decoded_image 回退与路径失效自动替换
+        # If a primary slot is a missing local path, replace it with decoded bytes/base64 payload.
+        merged_items = []
+        for idx, image_item in enumerate(resolved_primary_items):
+            if self._image_item_is_missing_path(image_item):
+                if idx < len(decoded_items):
+                    merged_items.append(decoded_items[idx])
+                else:
+                    merged_items.append(image_item)
+            else:
+                merged_items.append(image_item)
+
+        # 支持 bytes/base64/data URI 解码
+        # If primary is empty while decoded has content, fallback to decoded.
+        if len(merged_items) == 0 and len(decoded_items) > 0:
+            return decoded_items
+
+        return merged_items
+
     def __getitem__(self, item):
         """
         Note that we also return the raw_input_ids so that it can be combined with other chat template
@@ -186,15 +312,21 @@ class RLHFDataset(Dataset):
         messages = self._build_messages(row_dict)
         model_inputs = {}
 
-        if self.processor is not None:
+        can_use_multimodal_processor = self._processor_supports_multimodal_kwargs()
+
+        if can_use_multimodal_processor:
             from verl.utils.dataset.vision_utils import process_image, process_video
 
             raw_prompt = self.processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
             multi_modal_data = {}
 
             images = None
-            if self.image_key in row_dict:
-                images = [process_image(image) for image in row_dict.pop(self.image_key)]
+            if self.image_key in row_dict or self.decoded_image_key in row_dict:
+                image_items = self._pick_image_items(row_dict)
+                if image_items is not None:
+                    images = [process_image(image) for image in image_items]
+                else:
+                    images = None
                 multi_modal_data["image"] = images
 
             videos = None
@@ -218,6 +350,12 @@ class RLHFDataset(Dataset):
             row_dict["multi_modal_inputs"].pop("second_per_grid_ts", None)
 
         else:
+            if self.processor is not None and not self._warned_processor_fallback:
+                logger.warning(
+                    "Provided processor does not support multimodal kwargs (images/videos). "
+                    "Fallback to tokenizer-only path. Please upgrade transformers or use a proper VLM AutoProcessor."
+                )
+                self._warned_processor_fallback = True
             raw_prompt = self.tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
             model_inputs = self.tokenizer(raw_prompt, return_tensors="pt", add_special_tokens=False)
             input_ids = model_inputs.pop("input_ids")
@@ -232,7 +370,7 @@ class RLHFDataset(Dataset):
             truncation=self.truncation,
         )
 
-        if self.processor is not None and self.processor.image_processor.__class__.__name__ == "Qwen2VLImageProcessor":
+        if can_use_multimodal_processor and self.processor.image_processor.__class__.__name__ == "Qwen2VLImageProcessor":
             from verl.models.transformers.qwen2_vl import get_rope_index
 
             position_ids = [

@@ -32,6 +32,17 @@ from alphaapollo.core.environments.memory import EvolvingMemory, NDimensionalMem
 
 logger = logging.getLogger(__name__)
 
+
+def _extract_image_from_kwargs(sample_kwargs: Dict[str, Any]):
+    if not isinstance(sample_kwargs, dict):
+        return None
+    if "image" in sample_kwargs:
+        return sample_kwargs.get("image")
+    images = sample_kwargs.get("images")
+    if isinstance(images, list) and len(images) > 0:
+        return images[0]
+    return images
+
 def parse_gamefile(infos):
     gamefile = []
     for info in infos:
@@ -81,6 +92,8 @@ class InformalMathEvolvingEnvironmentManager(EnvironmentManagerBase):
         obs, infos = self.envs.reset(kwargs=kwargs)
         # self.tasks = obs
         self.tasks = [k.get("question", "") for k in kwargs]
+        self.obs_images = [_extract_image_from_kwargs(k) for k in kwargs]
+        has_image = any(img is not None for img in self.obs_images)
 
         self.memory.reset(batch_size=len(obs))
 
@@ -92,7 +105,7 @@ class InformalMathEvolvingEnvironmentManager(EnvironmentManagerBase):
                 use_previous_solutions=use_previous_solutions,
                 previous_solutions=kwargs[0].get("previous_solutions", "")
             ),
-            "image": None,
+            "image": self.obs_images if has_image else None,
             "anchor": obs.copy()
         }
         
@@ -171,7 +184,7 @@ class InformalMathEvolvingEnvironmentManager(EnvironmentManagerBase):
 
         next_observations = {
             "text": self.build_text_obs(next_obs, verifier=verifier, use_previous_solutions=use_previous_solutions, previous_solutions=previous_solutions),
-            "image": None,
+            "image": self.obs_images if hasattr(self, "obs_images") and any(img is not None for img in self.obs_images) else None,
             "anchor": next_obs.copy()
         }
         
@@ -299,12 +312,14 @@ class InformalMathTrainingEnvironmentManager(EnvironmentManagerBase):
     def reset(self, kwargs) -> Tuple[Dict[str, Any], List[Dict]]:
         obs, infos = self.envs.reset(kwargs=kwargs)
         self.tasks = obs
+        self.obs_images = [_extract_image_from_kwargs(k) for k in kwargs]
+        has_image = any(img is not None for img in self.obs_images)
 
         self.memory.reset(batch_size=len(obs))
 
         observations = {
             "text": self.build_text_obs(obs, init=True),
-            "image": None,
+            "image": self.obs_images if has_image else None,
             "anchor": obs.copy()
         }
         
@@ -329,7 +344,7 @@ class InformalMathTrainingEnvironmentManager(EnvironmentManagerBase):
 
         next_observations = {
             "text": self.build_text_obs(next_obs),
-            "image": None,
+            "image": self.obs_images if hasattr(self, "obs_images") and any(img is not None for img in self.obs_images) else None,
             "anchor": next_obs.copy()
         }
         

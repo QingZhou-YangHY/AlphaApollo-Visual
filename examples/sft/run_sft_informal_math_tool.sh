@@ -1,9 +1,9 @@
 set -x
 
-export CUDA_VISIBLE_DEVICES=0,1
-nproc_per_node=2
+export CUDA_VISIBLE_DEVICES=0
+nproc_per_node=1
 
-data_source='AI-MO/NuminaMath-TIR'
+data_source='datasets'
 
 python3 -m alphaapollo.data_preprocess.prepare_sft_tool \
     --data_source $data_source

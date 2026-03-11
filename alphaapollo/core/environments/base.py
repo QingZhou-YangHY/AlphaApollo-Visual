@@ -49,6 +49,8 @@ class EnvironmentManagerBase:
 
     def reset(self, kwargs) -> Dict[str, Any]:
         """
+        更合理的签名应是类似：Tuple[Dict[str, Any], List[Dict[str, Any]]]
+
         Reset all environments and return the initial observations.
         Parameters:
         - kwargs (Dict): Additional keyword arguments for resetting the environment.

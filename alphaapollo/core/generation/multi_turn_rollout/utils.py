@@ -59,8 +59,27 @@ def numpy_to_torch(array, device):
 
 
 def process_image(image, max_pixels: int = 2048 * 2048, min_pixels: int = 256 * 256):
+    if isinstance(image, dict):
+        # 一样返回 Image.IMage
+        from verl.utils.dataset.vision_utils import process_image as process_image_dict
+
+        image = process_image_dict(image)
+    elif isinstance(image, str):
+        image = Image.open(image)
+
+    if isinstance(image, Image.Image):
+        image = np.array(image.convert('RGB'))
+
     if isinstance(image, torch.Tensor):
         image = torch_to_numpy(image)
+
+    if not isinstance(image, np.ndarray):
+        raise ValueError(f"Unsupported type: {type(image)})")
+    
+    # 遵循 CHW 格式（Channel, Height, Width）
+    if image.ndim == 3 and image.shape[0] in (1, 3, 4):
+        image = np.transpose(image, (1, 2, 0))
+
     if image.max() < 1:
         image = image * 255.0
     if image.dtype != np.uint8:

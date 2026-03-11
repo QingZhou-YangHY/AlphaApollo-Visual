@@ -21,7 +21,6 @@ from verl.utils.model import compute_position_id_with_mask
 import verl.utils.torch_functional as verl_F
 from transformers import PreTrainedTokenizer
 import uuid
-from verl.models.transformers.qwen2_vl import get_rope_index
 from alphaapollo.core.generation.multi_turn_rollout.utils import filter_group_data, process_image, to_list_of_dict, torch_to_numpy
 from alphaapollo.core.environments import EnvironmentManagerBase
 from typing import List, Dict
@@ -40,6 +39,18 @@ class TrajectoryCollector:
         self.config = config
         self.tokenizer = tokenizer
         self.processor = processor
+
+    def _get_vl_rope_index(self):
+        # 新增 Qwen3 VL 的 rope index 获取，同时支持原版的 Qwen2 VL
+        # Gets the position ids
+        try:
+            from verl.models.transformers.qwen3_vl import get_rope_index as get_rope_index  # type: ignore
+
+            return get_rope_index
+        except Exception:
+            from verl.models.transformers.qwen2_vl import get_rope_index as get_rope_index
+
+            return get_rope_index
 
     def preprocess_single_sample(
         self,
@@ -75,6 +86,7 @@ class TrajectoryCollector:
         _obs_anchor = torch_to_numpy(obs_anchor, is_object=True) if isinstance(obs_anchor, torch.Tensor) else obs_anchor
 
         # Build chat structure
+        # 过于暴力, 弃用
         # obs_content = raw_prompt[0]['content']
         # if '<image>' in obs_content: 
         #     obs_content = obs_content.replace('<image>', '')
@@ -85,6 +97,10 @@ class TrajectoryCollector:
             obs_content += obs_text
         else:
             print(f"Warning: No text observation found!")
+
+        if is_multi_modal and '<image>' not in obs_content:
+            # 防止用户prompt里没有<image>标签，导致后续处理出问题
+            obs_content = '<image>\n' + obs_content
         
         chat = np.array([{
             "content": obs_content,
@@ -103,14 +119,20 @@ class TrajectoryCollector:
         
         # Process multimodal data
         if is_multi_modal:
+            if self.processor is None:
+                raise ValueError("processor is required for multimodal rollout, but got None")
+
             # Replace image placeholder with vision tokens
             raw_prompt = prompt_with_chat_template.replace('<image>', '<|vision_start|><|image_pad|><|vision_end|>')
             row_dict['multi_modal_data'] = {'image': [process_image(obs_image)]}
             image_inputs = self.processor.image_processor(row_dict['multi_modal_data']['image'], return_tensors='pt')
-            image_grid_thw = image_inputs['image_grid_thw']
+            image_grid_thw = image_inputs.get('image_grid_thw', None)
             row_dict['multi_modal_inputs'] = {key: val for key, val in image_inputs.items()}
-            if image_grid_thw is not None:
-                merge_length = self.processor.image_processor.merge_size**2
+            if image_grid_thw is not None and '<image>' in prompt_with_chat_template:
+                merge_size = getattr(self.processor.image_processor, 'merge_size', None)
+                if merge_size is None:
+                    merge_size = getattr(self.processor.image_processor, 'spatial_merge_size', 1)
+                merge_length = merge_size**2
                 index = 0
                 while '<image>' in prompt_with_chat_template:
                     prompt_with_chat_template = prompt_with_chat_template.replace(
@@ -121,8 +143,9 @@ class TrajectoryCollector:
                     )
                     index += 1
 
+                image_token = getattr(self.processor, 'image_token', '<|image_pad|>')
                 prompt_with_chat_template = prompt_with_chat_template.replace('<|placeholder|>',
-                                                                                self.processor.image_token)
+                                                                                image_token)
 
         else:
             raw_prompt = prompt_with_chat_template
@@ -133,16 +156,21 @@ class TrajectoryCollector:
                                                                             pad_token_id=self.tokenizer.pad_token_id,
                                                                             left_pad=True,
                                                                             truncation=self.config.data.truncation,)
+        # calculate position_ids
         if is_multi_modal:
-
-            position_ids = [
-                get_rope_index(
-                    self.processor,
-                    input_ids=input_ids[0],
-                    image_grid_thw=image_grid_thw,
-                    attention_mask=attention_mask[0],
-                )
-              ]  # (1, 3, seq_len)
+            try:
+                get_rope_index = self._get_vl_rope_index()
+                position_ids = [
+                    get_rope_index(
+                        self.processor,
+                        input_ids=input_ids[0],
+                        image_grid_thw=image_grid_thw,
+                        attention_mask=attention_mask[0],
+                    )
+                ]  # (1, 3, seq_len)
+            except Exception:
+                # Fallback keeps rollout running even if backend mrope helper is unavailable.
+                position_ids = compute_position_id_with_mask(attention_mask)
         else:
             position_ids = compute_position_id_with_mask(attention_mask)
 

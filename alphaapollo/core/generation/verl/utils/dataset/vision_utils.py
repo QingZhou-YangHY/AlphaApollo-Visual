@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import base64
 from io import BytesIO
+from pathlib import Path
 from typing import Optional, Union
 
 import torch
@@ -20,13 +22,69 @@ from PIL import Image
 from qwen_vl_utils import fetch_image, fetch_video
 
 
-def process_image(image: Union[dict, Image.Image]) -> Image.Image:
+def _decode_base64_to_bytes(payload: str) -> bytes:
+    # Support both raw base64 payload and RFC2397 data URI payload.
+    if payload.startswith("data:") and "," in payload:
+        payload = payload.split(",", 1)[1]
+    return base64.b64decode(payload)
+
+
+def _to_image_field(value):
+    if value is None:
+        return None
+    if isinstance(value, BytesIO):
+        return value
+    if isinstance(value, memoryview):
+        return BytesIO(value.tobytes())
+    if isinstance(value, (bytes, bytearray)):
+        return BytesIO(bytes(value))
+    if isinstance(value, str):
+        # 这里因为 .parquet 文件里可能会直接存 base64 字符串来表示图片
+        # Allow inline images provided as data URI.
+        if value.startswith("data:"):
+            return BytesIO(_decode_base64_to_bytes(value))
+        return value
+    if isinstance(value, Path):
+        return str(value)
+    return value
+
+
+def process_image(image: Union[dict, Image.Image, str, Path]) -> Image.Image:
     if isinstance(image, Image.Image):
         return image.convert("RGB")
 
+    if isinstance(image, (bytes, bytearray, memoryview, BytesIO)):
+        image = {"image": _to_image_field(image)}
+
+    if isinstance(image, (str, Path)):
+        image = {"image": str(image)}
+
+    if not isinstance(image, dict):
+        raise TypeError(f"Unsupported image payload type: {type(image)}")
+
+    image = dict(image)
+
+    # Accept parquet-style nested payload: {'decoded_image': {'bytes': ..., 'path': ...}}.
+    if "decoded_image" in image and "image" not in image:
+        decoded = image["decoded_image"]
+        if isinstance(decoded, dict):
+            image.update(decoded)
+
+    # Accept explicit base64 fields and normalize into `image` for downstream loader.
+    if "base64" in image and "image" not in image:
+        image["image"] = _to_image_field(BytesIO(_decode_base64_to_bytes(image["base64"])))
+    elif "b64" in image and "image" not in image:
+        image["image"] = _to_image_field(BytesIO(_decode_base64_to_bytes(image["b64"])))
+
     if "bytes" in image:
         assert "image" not in image, "Cannot have both `bytes` and `image`"
-        image["image"] = BytesIO(image["bytes"])
+        image["image"] = _to_image_field(image["bytes"])
+
+    if "path" in image and "image" not in image:
+        image["image"] = _to_image_field(image["path"])
+
+    if "image" in image:
+        image["image"] = _to_image_field(image["image"])
 
     return fetch_image(image)
 
