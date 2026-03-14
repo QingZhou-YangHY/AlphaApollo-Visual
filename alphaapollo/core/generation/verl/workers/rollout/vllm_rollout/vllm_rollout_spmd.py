@@ -147,9 +147,13 @@ class vLLMRollout(BaseRollout):
         #    (which can vary across different vLLM versions);
         # - Otherwise it's the desired value we want to explicitly set.
         engine_kwargs = {key: val for key, val in engine_kwargs.items() if val is not None}
+        
+        # vLLM 0.6.6 does not support enable_sleep_mode in LLM constructor.
+        # It was introduced in later versions (0.7.0+).
+        # 更新回来重新进行使用, 设置为False
         self.inference_engine = LLM(
             model=model_path,
-            enable_sleep_mode=True,
+            enable_sleep_mode=False,
             tensor_parallel_size=tensor_parallel_size,
             distributed_executor_backend="external_launcher",
             dtype=config.dtype,
@@ -172,7 +176,7 @@ class vLLMRollout(BaseRollout):
         )
 
         # Offload vllm model to reduce peak memory usage
-        self.inference_engine.sleep(level=1)
+        # self.inference_engine.sleep(level=1)
 
         kwargs = dict(
             n=1,

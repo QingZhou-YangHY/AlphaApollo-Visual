@@ -161,9 +161,10 @@ class AsyncvLLMServer(AsyncServerBase):
                 kwargs[k] = config.get(k)
         print(f"override_generation_config: {kwargs}")
 
+        # enable_sleep_mode is not supported in vLLM 0.6.6 EngineArgs
         engine_args = AsyncEngineArgs(
             model=local_path,
-            enable_sleep_mode=True,
+            enable_sleep_mode=config.get("enable_sleep_mode", False),
             override_generation_config=kwargs,
             tensor_parallel_size=tensor_parallel_size,
             distributed_executor_backend=ExternalRayDistributedExecutor,

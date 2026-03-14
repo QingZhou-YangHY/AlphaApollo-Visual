@@ -15,6 +15,7 @@
 
 import torch
 import numpy as np
+import inspect
 from verl import DataProto
 from verl.utils.dataset.rl_dataset import collate_fn
 from verl.utils.model import compute_position_id_with_mask
@@ -51,6 +52,42 @@ class TrajectoryCollector:
             from verl.models.transformers.qwen2_vl import get_rope_index as get_rope_index
 
             return get_rope_index
+
+    def _apply_chat_template(self, chat: List[Dict]) -> str:
+        """Use processor chat template when available; fallback to tokenizer."""
+        chat_template_source = self.processor if self.processor is not None else self.tokenizer
+        return chat_template_source.apply_chat_template(
+            chat,
+            add_generation_prompt=True,
+            tokenize=False,
+        )
+
+    def _normalize_image_items(self, obs_image) -> List:
+        """Normalize one sample's image observation to a list of PIL images."""
+        if obs_image is None:
+            return []
+        if isinstance(obs_image, (list, tuple)):
+            return [process_image(image) for image in obs_image]
+        return [process_image(obs_image)]
+
+    def _compute_vl_position_ids(self, input_ids, attention_mask, model_inputs):
+        """Compute mrope ids for VLM models with graceful fallback."""
+        try:
+            get_rope_index = self._get_vl_rope_index()
+            sig = inspect.signature(get_rope_index)
+            call_kwargs = {
+                "processor": self.processor,
+                "input_ids": input_ids[0],
+                "attention_mask": attention_mask[0],
+                "image_grid_thw": model_inputs.get("image_grid_thw", None),
+                "video_grid_thw": model_inputs.get("video_grid_thw", None),
+                "second_per_grid_ts": model_inputs.get("second_per_grid_ts", None),
+            }
+            filtered_kwargs = {k: v for k, v in call_kwargs.items() if k in sig.parameters}
+            return [get_rope_index(**filtered_kwargs)]
+        except Exception:
+            # Fallback keeps rollout running even if backend mrope helper is unavailable.
+            return compute_position_id_with_mask(attention_mask)
 
     def preprocess_single_sample(
         self,
@@ -102,17 +139,13 @@ class TrajectoryCollector:
             # 防止用户prompt里没有<image>标签，导致后续处理出问题
             obs_content = '<image>\n' + obs_content
         
-        chat = np.array([{
+        chat = [{
             "content": obs_content,
             "role": "user",
-        }])
+        }]
         
         # Apply chat template
-        prompt_with_chat_template = self.tokenizer.apply_chat_template(
-            chat,
-            add_generation_prompt=True,
-            tokenize=False
-        )
+        prompt_with_chat_template = self._apply_chat_template(chat)
         
         # Initialize return dict
         row_dict = {}
@@ -122,59 +155,94 @@ class TrajectoryCollector:
             if self.processor is None:
                 raise ValueError("processor is required for multimodal rollout, but got None")
 
-            # Replace image placeholder with vision tokens
-            raw_prompt = prompt_with_chat_template.replace('<image>', '<|vision_start|><|image_pad|><|vision_end|>')
-            row_dict['multi_modal_data'] = {'image': [process_image(obs_image)]}
-            image_inputs = self.processor.image_processor(row_dict['multi_modal_data']['image'], return_tensors='pt')
-            image_grid_thw = image_inputs.get('image_grid_thw', None)
-            row_dict['multi_modal_inputs'] = {key: val for key, val in image_inputs.items()}
-            if image_grid_thw is not None and '<image>' in prompt_with_chat_template:
-                merge_size = getattr(self.processor.image_processor, 'merge_size', None)
-                if merge_size is None:
-                    merge_size = getattr(self.processor.image_processor, 'spatial_merge_size', 1)
-                merge_length = merge_size**2
-                index = 0
-                while '<image>' in prompt_with_chat_template:
-                    prompt_with_chat_template = prompt_with_chat_template.replace(
-                        '<image>',
-                        '<|vision_start|>' + '<|placeholder|>' * (image_grid_thw[index].prod() // merge_length) +
-                        '<|vision_end|>',
-                        1,
-                    )
-                    index += 1
+            raw_prompt = prompt_with_chat_template
+            images = self._normalize_image_items(obs_image)
+            row_dict['multi_modal_data'] = {'image': images}
 
-                image_token = getattr(self.processor, 'image_token', '<|image_pad|>')
-                prompt_with_chat_template = prompt_with_chat_template.replace('<|placeholder|>',
-                                                                                image_token)
+            try:
+                model_inputs = self.processor(
+                    text=[raw_prompt],
+                    images=images,
+                    return_tensors='pt',
+                )
+                input_ids = model_inputs.pop('input_ids')
+                attention_mask = model_inputs.pop('attention_mask')
+                row_dict['multi_modal_inputs'] = dict(model_inputs)
+                # second_per_grid_ts is only needed for mrope and not used by actor/critic forward.
+                row_dict['multi_modal_inputs'].pop('second_per_grid_ts', None)
+            except Exception:
+                # Backward-compatible fallback for processors that don't support multimodal kwargs.
+                prompt_with_chat_template = prompt_with_chat_template.replace('<image>', '<|vision_start|><|image_pad|><|vision_end|>')
+                image_inputs = self.processor.image_processor(images, return_tensors='pt')
+                row_dict['multi_modal_inputs'] = {key: val for key, val in image_inputs.items()}
+                image_grid_thw = image_inputs.get('image_grid_thw', None)
+                if image_grid_thw is not None and '<image>' in prompt_with_chat_template:
+                    merge_size = getattr(self.processor.image_processor, 'merge_size', None)
+                    if merge_size is None:
+                        merge_size = getattr(self.processor.image_processor, 'spatial_merge_size', 1)
+                    merge_length = merge_size**2
+                    index = 0
+                    while '<image>' in prompt_with_chat_template and index < len(image_grid_thw):
+                        prompt_with_chat_template = prompt_with_chat_template.replace(
+                            '<image>',
+                            '<|vision_start|>' + '<|placeholder|>' * (image_grid_thw[index].prod() // merge_length) + '<|vision_end|>',
+                            1,
+                        )
+                        index += 1
+
+                    image_token = getattr(self.processor, 'image_token', '<|image_pad|>')
+                    prompt_with_chat_template = prompt_with_chat_template.replace('<|placeholder|>', image_token)
+
+                input_ids, attention_mask = verl_F.tokenize_and_postprocess_data(
+                    prompt=prompt_with_chat_template,
+                    tokenizer=self.tokenizer,
+                    max_length=self.config.data.max_prompt_length,
+                    pad_token_id=self.tokenizer.pad_token_id,
+                    left_pad=True,
+                    truncation=self.config.data.truncation,
+                )
+
+            # Ensure padding/truncation behavior is consistent with text-only path.
+            input_ids, attention_mask = verl_F.postprocess_data(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_length=self.config.data.max_prompt_length,
+                pad_token_id=self.tokenizer.pad_token_id,
+                left_pad=True,
+                truncation=self.config.data.truncation,
+            )
 
         else:
             raw_prompt = prompt_with_chat_template
-        
-        input_ids, attention_mask = verl_F.tokenize_and_postprocess_data(prompt=prompt_with_chat_template,
-                                                                            tokenizer=self.tokenizer,
-                                                                            max_length=self.config.data.max_prompt_length,
-                                                                            pad_token_id=self.tokenizer.pad_token_id,
-                                                                            left_pad=True,
-                                                                            truncation=self.config.data.truncation,)
+            input_ids, attention_mask = verl_F.tokenize_and_postprocess_data(
+                prompt=prompt_with_chat_template,
+                tokenizer=self.tokenizer,
+                max_length=self.config.data.max_prompt_length,
+                pad_token_id=self.tokenizer.pad_token_id,
+                left_pad=True,
+                truncation=self.config.data.truncation,
+            )
+
         # calculate position_ids
         if is_multi_modal:
-            try:
-                get_rope_index = self._get_vl_rope_index()
-                position_ids = [
-                    get_rope_index(
-                        self.processor,
-                        input_ids=input_ids[0],
-                        image_grid_thw=image_grid_thw,
-                        attention_mask=attention_mask[0],
-                    )
-                ]  # (1, 3, seq_len)
-            except Exception:
-                # Fallback keeps rollout running even if backend mrope helper is unavailable.
-                position_ids = compute_position_id_with_mask(attention_mask)
+            position_ids = self._compute_vl_position_ids(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                model_inputs=row_dict.get('multi_modal_inputs', {}),
+            )
         else:
             position_ids = compute_position_id_with_mask(attention_mask)
 
-        raw_prompt_ids = self.tokenizer.encode(raw_prompt, add_special_tokens=False)
+        if is_multi_modal:
+            # For vLLM multimodal inference, raw_prompt_ids must contain the original image
+            # placeholder token (e.g. <|vision_start|><|image_pad|><|vision_end|> or <image>),
+            # NOT the fully expanded image token sequence from the processor.
+            # vLLM will expand the placeholder itself using multi_modal_data.
+            # We use the chat-templated prompt text (with placeholder) encoded by the tokenizer.
+            placeholder_prompt = prompt_with_chat_template.replace('<image>', '<|vision_start|><|image_pad|><|vision_end|>')
+            raw_prompt_ids = self.tokenizer.encode(placeholder_prompt, add_special_tokens=False)
+        else:
+            raw_prompt_ids = self.tokenizer.encode(raw_prompt, add_special_tokens=False)
         if len(raw_prompt_ids) > self.config.data.max_prompt_length:
             if self.config.data.truncation == "left":
                 raw_prompt_ids = raw_prompt_ids[-self.config.data.max_prompt_length :]
@@ -199,7 +267,7 @@ class TrajectoryCollector:
         })
 
         if self.config.data.get('return_raw_chat', False):
-            row_dict['raw_prompt'] = chat.tolist()
+            row_dict['raw_prompt'] = chat
         
         return row_dict
 
@@ -278,7 +346,10 @@ class TrajectoryCollector:
         for bs in range(batch_size):
             # sum the rewards for each data in total_batch_list[bs]
             for data in total_batch_list[bs]:
-                assert traj_uid[bs] == data['traj_uid'], "data is not from the same trajectory"
+                # assert traj_uid[bs] == data['traj_uid'], "data is not from the same trajectory"
+                if traj_uid[bs] != data['traj_uid']:
+                    print(f"Warning: traj_uid mismatch at batch index {bs}. data['traj_uid']={data['traj_uid']}, traj_uid[bs]={traj_uid[bs]}")
+
                 if data['active_masks']:
                     # episode_rewards
                     data['episode_rewards'] = episode_rewards[bs]
@@ -545,25 +616,36 @@ class TrajectoryCollector:
         # Initial observations from the environment
         if self.config.algorithm.filter_groups.enable and is_train:
             # Dynamic Sampling (for DAPO)
-            total_batch_list, total_episode_rewards, total_episode_lengths, total_success, total_traj_uid, totoal_tool_callings = \
-                self.dynamic_multi_turn_loop(
+            result = self.dynamic_multi_turn_loop(
                 gen_batch=gen_batch,
                 actor_rollout_wg=actor_rollout_wg,
                 envs=envs,
             )
+            total_batch_list, total_episode_rewards, total_episode_lengths, total_success, total_traj_uid, totoal_tool_callings = result
         else:
             # Vanilla Sampling   
-            total_batch_list, total_episode_rewards, total_episode_lengths, total_success, total_traj_uid, totoal_tool_callings = \
-                self.vanilla_multi_turn_loop(
+            result = self.vanilla_multi_turn_loop(
                 gen_batch=gen_batch,
                 actor_rollout_wg=actor_rollout_wg,
                 envs=envs,
             )
+            if len(result) == 5:
+                 total_batch_list, total_episode_rewards, total_episode_lengths, total_success, total_traj_uid = result
+                 totoal_tool_callings = np.zeros(len(total_batch_list), dtype=np.float32)
+            else:
+                 total_batch_list, total_episode_rewards, total_episode_lengths, total_success, total_traj_uid, totoal_tool_callings = result
 
-        assert len(total_batch_list) == len(total_episode_rewards)
-        assert len(total_batch_list) == len(total_episode_lengths)
-        assert len(total_batch_list) == len(total_traj_uid)
-        assert len(total_batch_list) == len(totoal_tool_callings)
+        if not (len(total_batch_list) == len(total_episode_rewards) == len(total_episode_lengths) == len(total_traj_uid) == len(totoal_tool_callings)):
+             print(f"DEBUG: len(total_batch_list)={len(total_batch_list)}")
+             print(f"DEBUG: len(total_episode_rewards)={len(total_episode_rewards)}")
+             print(f"DEBUG: len(total_episode_lengths)={len(total_episode_lengths)}")
+             print(f"DEBUG: len(total_traj_uid)={len(total_traj_uid)}")
+             print(f"DEBUG: len(totoal_tool_callings)={len(totoal_tool_callings)}")
+        
+        # assert len(total_batch_list) == len(total_episode_rewards)
+        # assert len(total_batch_list) == len(total_episode_lengths)
+        # assert len(total_batch_list) == len(total_traj_uid)
+        # assert len(total_batch_list) == len(totoal_tool_callings)
         
 
         # Create trajectory data

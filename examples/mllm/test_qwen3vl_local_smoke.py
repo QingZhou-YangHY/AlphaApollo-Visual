@@ -88,12 +88,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Qwen3-VL local smoke test")
     parser.add_argument(
         "--model-path",
-        default="/root/autodl-tmp/qwen/qwen3_vl_2b",
+        default="/gz-data/qwen3vl_2b",
         help="Local model path",
     )
     parser.add_argument(
         "--train-file",
-        default="/root/autodl-tmp/AlphaApollo-Visual/datasets/data/testmini-00000-of-00001-725687bf7a18d64b.parquet",
+        default="/gz-data/dataset/data/test-00000-of-00002-6b81bd7f7e2065e6.parquet",
         help="Parquet file for RLHFDataset smoke test",
     )
     parser.add_argument("--prompt-key", default="query", help="Prompt key in parquet")

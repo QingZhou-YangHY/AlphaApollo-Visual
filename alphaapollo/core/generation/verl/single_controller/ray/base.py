@@ -91,6 +91,7 @@ class RayResourcePool(ResourcePool):
         max_colocate_count: int = 10,
         detached=False,
         accelerator_type: Optional[str] = None,
+        ray_kwargs: Optional[Dict[str, Any]] = None,
     ) -> None:
         super().__init__(process_on_nodes, max_colocate_count)
         self.use_gpu = use_gpu
@@ -99,6 +100,7 @@ class RayResourcePool(ResourcePool):
         self.pgs = None
         self.detached = detached
         self.accelerator_type = accelerator_type
+        self.ray_kwargs = ray_kwargs or {}
 
     def get_placement_groups(self, strategy="STRICT_PACK", name=None, device_name="cuda"):
         if self.pgs is not None:
@@ -353,7 +355,19 @@ class RayWorkerGroup(WorkerGroup):
                 cia_name = match.group(1) if match else cia_name  # "ActorClass(Obj)" -> "Obj"
                 name = f"{self.name_prefix}{cia_name}_{pg_idx}:{local_rank}"  # e.g. Worker_2:5
 
-                ray_cls_with_init.update_options({"runtime_env": {"env_vars": env_vars}, "name": name})
+                options = {"runtime_env": {"env_vars": env_vars}, "name": name}
+                if resource_pool.ray_kwargs:
+                    options.update(resource_pool.ray_kwargs)
+                    # Merge runtime_env if both exist
+                    if "runtime_env" in resource_pool.ray_kwargs:
+                        new_runtime_env = deepcopy(resource_pool.ray_kwargs["runtime_env"])
+                        if "env_vars" in new_runtime_env:
+                            new_runtime_env["env_vars"].update(env_vars)
+                        else:
+                            new_runtime_env["env_vars"] = env_vars
+                        options["runtime_env"] = new_runtime_env
+
+                ray_cls_with_init.update_options(options)
 
                 if detached:
                     ray_cls_with_init.update_options({"lifetime": "detached"})
