@@ -16,6 +16,8 @@
 import torch
 import numpy as np
 import inspect
+import concurrent.futures
+from functools import partial
 from verl import DataProto
 from verl.utils.dataset.rl_dataset import collate_fn
 from verl.utils.model import compute_position_id_with_mask
@@ -290,17 +292,11 @@ class TrajectoryCollector:
             DataProto: Contains processed batch data with preserved metadata
         """
         batch_size = len(gen_batch.batch['input_ids'])
-        processed_samples = []
-        
-        # Process each sample in parallel
-        for item in range(batch_size):
-            # Extract per-sample observations
-            processed = self.preprocess_single_sample(
-                item=item,
-                gen_batch=gen_batch,
-                obs=obs,
-            )
-            processed_samples.append(processed)
+
+        _process = partial(self.preprocess_single_sample, gen_batch=gen_batch, obs=obs)
+        num_workers = self.config.data.get("preprocess_num_workers", batch_size)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(batch_size, num_workers)) as executor:
+            processed_samples = list(executor.map(_process, range(batch_size)))
         
         # Aggregate batch data
         batch = collate_fn(processed_samples)
@@ -368,6 +364,7 @@ class TrajectoryCollector:
         gen_batch_output = DataProto.from_single_dict(
             data=collate_fn(effective_batch)
         )
+        del effective_batch
         return gen_batch_output
 
     def vanilla_multi_turn_loop(
@@ -443,6 +440,8 @@ class TrajectoryCollector:
             batch_output_padded = actor_rollout_wg.generate_sequences(batch_input_padded)
             # # unpad
             batch_output = unpad_dataproto(batch_output_padded, pad_size=pad_size)
+            # 删掉中间变量修内存泄漏
+            del batch_input, batch_input_padded, batch_output_padded
 
             batch.non_tensor_batch['uid'] = uid_batch
             batch.non_tensor_batch['traj_uid'] = traj_uid
@@ -497,6 +496,8 @@ class TrajectoryCollector:
             
             # Update episode lengths for active environments
             batch_list: list[dict] = to_list_of_dict(batch)
+            del batch, batch_output
+            torch.cuda.empty_cache()
 
             for i in range(batch_size):
                 total_batch_list[i].append(batch_list[i])

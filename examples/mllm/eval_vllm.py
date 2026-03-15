@@ -6,6 +6,17 @@ Usage:
   python examples/mllm/eval_mathvista_testmini_qwen3vl_rollout_vllm.py \
       --model-path /gz-data/qwen3vl_2b \
       --data-file /gz-data/dataset/data/testmini-00000-of-00001-725687bf7a18d64b.parquet
+
+为什么没换成ray实现并行预处理?
+
+现在整个数据流是基于 HuggingFace datasets + RLHFDataset，
+dataset[i] 的访问接口、collate_fn、DataProto 的构建都要跟着改
+
+preprocess_single_sample 依赖 self.tokenizer、self.processor 这些实例状态，传给 Ray remote 函数需要序列化，有额外开销
+
+Ray 的 actor/worker 和现有的 RayWorkerGroup 混用，资源调度会更复杂
+
+现在用 ThreadPoolExecutor 已经解决了主要瓶颈，如果有跨节点分布式数据预处理的需求再换
 """
 
 from __future__ import annotations
@@ -20,6 +31,8 @@ from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+import concurrent.futures
 
 import numpy as np
 import ray
@@ -350,6 +363,7 @@ def build_config(args: argparse.Namespace):
     config.data.return_full_prompt = True
     config.data.filter_overlong_prompts = False
     config.data.n_samples = 1
+    config.data.preprocess_num_workers = args.data_num_workers
 
     config.env.max_steps = 1
     config.env.rollout.n = 1
@@ -441,7 +455,8 @@ def run_eval(args: argparse.Namespace) -> int:
             sample_indices = list(range(start, stop))
 
             rows = [dict(dataset.dataframe[i]) for i in sample_indices]
-            samples = [dataset[i] for i in sample_indices]
+            with concurrent.futures.ThreadPoolExecutor(max_workers=args.data_num_workers) as executor:
+                samples = list(executor.map(dataset.__getitem__, sample_indices))
 
             for row, sample in zip(rows, samples):
                 image_items = dataset._pick_image_items(dict(row))
@@ -564,6 +579,33 @@ def run_eval(args: argparse.Namespace) -> int:
                 records.append(rec)
                 fout.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
+            # Explicitly release GPU tensors to prevent VRAM accumulation across batches
+            del gen_batch_output, gen_batch, batch, batch_dict, samples, rows
+            torch.cuda.empty_cache()
+
+            # Force Python GC to drop any lingering references before Ray GC runs
+            import gc
+            gc.collect()
+
+            # Evict all unreferenced objects from Ray's plasma object store.
+            # Ray's GC is reference-counted: once all Python ObjectRef handles are
+            # deleted above, the objects become eligible for eviction, but the
+            # plasma store won't actually reclaim the pages until we nudge it.
+            try:
+                # get_all_reference_counts returns {object_id: ref_count}; any
+                # entry with ref_count == 0 is already unreferenced and will be
+                # freed by the subsequent internal_kv flush.
+                unreferenced = [
+                    oid for oid, cnt in ray._private.state.state.get_all_reference_counts().items()
+                    if cnt == 0
+                ]
+                if unreferenced:
+                    ray._private.internal_api.free(unreferenced, local_only=True)
+            except Exception:
+                # Ray internal APIs can change across versions; fail silently so
+                # the eval loop is never interrupted by cleanup errors.
+                pass
+
     overall_correct = sum(1 for r in records if r.get("correct"))
     overall_total = len(records)
     overall_acc = (overall_correct / overall_total) if overall_total else 0.0
@@ -612,7 +654,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=8, help="Evaluation batch size")
     parser.add_argument("--max-prompt-length", type=int, default=4096, help="Max prompt length")
     parser.add_argument("--max-new-tokens", type=int, default=1024, help="Max generated tokens")
-    parser.add_argument("--max-samples", type=int, default=-1000, help="Max samples; <=0 means full set")
+    parser.add_argument("--max-samples", type=int, default=1000, help="Max samples; <=0 means full set")
 
     parser.add_argument("--do-sample", action="store_true", help="Enable sampling")
     parser.add_argument("--temperature", type=float, default=0.0, help="Sampling temperature")
@@ -622,6 +664,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-gpus-per-node", type=int, default=1, help="GPUs used by rollout worker group")
     parser.add_argument("--tensor-parallel-size", type=int, default=1, help="vLLM tensor parallel size")
     parser.add_argument("--ray-num-cpus", type=int, default=8, help="Ray CPU resources")
+    parser.add_argument("--data-num-workers", type=int, default=4, help="ThreadPoolExecutor workers for parallel dataset __getitem__")
     parser.add_argument(
         "--max-colocate-count",
         type=int,

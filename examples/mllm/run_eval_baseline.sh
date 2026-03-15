@@ -17,7 +17,7 @@ MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-2048}
 PREFETCH_WORKERS=${PREFETCH_WORKERS:-8}
 PREFETCH_SIZE=${PREFETCH_SIZE:-32}
 
-python3 -u examples/mllm/eval_mathvista_testmini_qwen3vl_local.py \
+python3 -u examples/mllm/eval_baseline.py \
     --model-path "${MODEL_PATH}" \
     --data-file "${DATA_FILE}" \
     --max-samples "${MAX_SAMPLES}" \

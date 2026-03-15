@@ -29,7 +29,11 @@ def to_list_of_dict(batch: DataProto) -> list[dict]:
     for bs in range(batch_size):
         save_dict = dict()
         for key, val in tensors.items():
-            save_dict[key] = val[bs]
+            # Detach and move to CPU to avoid accumulating GPU memory across steps
+            v = val[bs]
+            if isinstance(v, torch.Tensor):
+                v = v.detach().cpu()
+            save_dict[key] = v
         for key, val in non_tensor.items():
             save_dict[key] = val[bs]
         save_list.append(save_dict)
